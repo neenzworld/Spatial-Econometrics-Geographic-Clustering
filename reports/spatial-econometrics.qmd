@@ -1,0 +1,334 @@
+---
+title: "Spatial Econometrics & Geographic Clustering"
+subtitle: "Cross-Sectional Spatial Analysis of Global Health Disparities, Contiguity Weight Matrices and LISA Clusters"
+author: "Neena Abimbola Albarus"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    theme: flatly
+    code-fold: show
+    code-tools: true
+    fig-align: center
+---
+
+```{r setup, include=FALSE}
+# ==============================================================================
+# LECTURER SETUP & PACKAGES
+# ==============================================================================
+library(tidyverse)
+library(sf)
+library(rnaturalearth)
+library(spdep)
+library(RColorBrewer)
+library(viridis)
+```
+
+## Theoretical Foundations & Methodological Overview
+
+Standard Ordinary Least Squares (OLS) regression relies on the fundamental assumption that observational units are independent and identically distributed ($e_i \sim \text{i.i.d.}$). In international relations, comparative political economy, and global public health, this assumption of independence rarely holds true. Observational units do not exist in geographic isolation; rather, they interact across administrative boundaries through physical proximity, bilateral trade flows, migration channels, shared ecosystems, and policy contagion.
+
+As Waldo Tobler articulated in his First Law of Geography: *"Everything is related to everything else, but near things are more related than distant things."*
+
+When analyzing cross-sectional public health indicators such as national life expectancy, ignoring spatial dependence introduces three major theoretical and econometric vulnerabilities:
+
+1. **Spatial Autocorrelation**: Unobserved exogenous shocks (e.g., epidemic outbreaks, climate shocks, regional conflicts) spill across national borders, causing regression residuals to cluster geographically.
+
+2. **Standard Error Bias**: Treating spatially dependent nations as independent overestimates the effective sample size (N), suppressing standard errors and inflating t-statistics.
+
+3. **Substantive Misspecification**: Ignoring neighborhood context fails to capture how policy interventions or health dynamics in adjacent states directly impact domestic outcomes.
+
+### Learning Objectives
+
+By completing this analytical workbook, you will develop competence in:
+
+- Executing spatial joins between cross-sectional attribute data and vector boundary polygons using `sf` and `rnaturalearth`.
+- Constructing spatial neighbor linkages and row-standardized spatial weight matrices (W) using `spdep`.
+- Calculating spatial lag variables (Wy) to systematically quantify neighborhood context effects.
+- Running Global Moran's I hypothesis tests to evaluate global spatial autocorrelation.
+- Deriving and mapping Local Indicators of Spatial Association (LISA) to detect statistically significant health hotspots, coldspots, and spatial outliers.
+
+## Module 1: Dynamic Data Path Resolution & Spatial Ingestion
+
+To model spatial clustering across global economies, we load cross-sectional life expectancy records from Our World in Data (OWID) for 2019 and join them with vector boundary polygons from Natural Earth using ISO 3-letter country codes (`iso_a3`).
+
+```{r}
+# Dynamic Path Resolution for execution flexibility across root or /reports working directories
+possible_paths <- c(
+  "data/life_expectancy_data.csv",
+  "../data/life_expectancy_data.csv",
+  "/Users/yawdgyal/Desktop/R for github/Spatial Econometrics & Geographic Clustering/data/life_expectancy_data.csv"
+)
+
+data_path <- possible_paths[file.exists(possible_paths)][1]
+
+if (is.na(data_path)) {
+  stop("Could not locate 'life_expectancy_data.csv'. Please verify it exists in your project's data/ folder.")
+}
+
+# Ingest raw OWID panel dataset
+owid_raw <- read_csv(data_path)
+
+# Standardize column names and filter to 2019 cross-section
+owid_2019 <- owid_raw %>%
+  rename(
+    country  = Entity,
+    code     = Code,
+    year     = Year,
+    life_exp = `Life expectancy`
+  ) %>%
+  filter(year == 2019, !is.na(code)) %>%
+  select(code, country, life_exp)
+
+# Fetch spatial geometries from Natural Earth
+world_polygons <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  select(iso_a3, name, continent, geometry) %>%
+  filter(continent != "Antarctica")
+
+# Join attribute data with vector boundaries on ISO 3-letter codes
+spatial_df <- world_polygons %>%
+  inner_join(owid_2019, by = c("iso_a3" = "code")) %>%
+  filter(!st_is_empty(geometry))
+
+head(spatial_df)
+```
+
+## Module 2: Cartographic & Distributional Visualizations
+
+Choropleth mapping and distribution plots allow us to visually examine continuous geographic gradients and regional health variations across global continents.
+
+```{r}
+fig1 <- ggplot(data = spatial_df) +
+  geom_sf(aes(fill = life_exp), color = "white", size = 0.15) +
+  scale_fill_viridis_c(
+    option = "magma", 
+    name = "Life Exp.\n(Years)",
+    na.value = "grey80"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Figure 1: Global Distribution of National Life Expectancy (2019)",
+    subtitle = "Continuous Spatial Projection Illustrating Global Health Disparities",
+    caption = "Source: Our World in Data & Natural Earth"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.key.width = unit(2, "cm"),
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+print(fig1)
+```
+
+```{r}
+fig2 <- ggplot(spatial_df, aes(x = reorder(continent, life_exp, FUN = median), y = life_exp, fill = continent)) +
+  geom_violin(alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.2, outlier.color = "red", alpha = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.5, size = 1.5, color = "grey20") +
+  scale_fill_brewer(palette = "Set2") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Figure 2: Continental Distribution & Intra-Regional Variance",
+    subtitle = "Violin and Boxplot Decompositions of Health Metrics (2019)",
+    x = "Continent",
+    y = "Life Expectancy at Birth (Years)"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+print(fig2)
+```
+
+## Module 3: Spatial Weight Matrices (W) & Spatial Lag Construction
+
+To quantify spatial dependencies, we define neighbor linkages using a **Queen Contiguity Matrix** (units sharing a boundary edge or vertex) and apply **Row Standardization** (`style = "W"`).
+
+The spatial lag ($Wy_i$) computes the weighted average life expectancy of nation $i$'s immediate geographic neighbors:
+
+$$
+\text{Spatial Lag}_i = \sum_{j=1}^{N} w_{ij} y_j \quad \text{where} \quad \sum_{j=1}^{N} w_{ij} = 1
+$$
+
+```{r}
+# Spatial Weight Matrix & Spatial Lag Construction
+neighbors_list <- poly2nb(spatial_df, queen = TRUE)
+spatial_weights <- nb2listw(neighbors_list, style = "W", zero.policy = TRUE)
+
+spatial_df$spatial_lag_life_exp <- lag.listw(spatial_weights, spatial_df$life_exp, zero.policy = TRUE)
+
+spatial_df <- spatial_df %>%
+  mutate(
+    scale_life_exp = scale(life_exp)[,1],
+    scale_lag_life_exp = scale(spatial_lag_life_exp)[,1]
+  )
+```
+
+### Global Moran's Scatterplot
+
+Plotting a country's standardized life expectancy ($Zy_i$) against its neighborhood's standardized spatial lag ($ZWy_i$) yields a **Moran Scatterplot**. The slope of the regression trendline corresponds directly to the Global Moran's I coefficient.
+
+```{r}
+fig3 <- ggplot(spatial_df, aes(x = scale_life_exp, y = scale_lag_life_exp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(color = "steelblue", alpha = 0.7, size = 2.5) +
+  geom_smooth(method = "lm", color = "firebrick", se = TRUE) +
+  theme_minimal() +
+  labs(
+    title = "Figure 3: Global Moran's Scatterplot of Health Metrics",
+    subtitle = "Slope Equals the Global Moran's I Spatial Autocorrelation Coefficient",
+    x = "Standardized National Life Expectancy (Z-Score)",
+    y = "Standardized Spatial Lag / Neighbor Average (Z-Score)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+print(fig3)
+```
+
+## Module 4: Autocorrelation Testing & LISA Diagnostics
+
+### Global Moran's I Test
+
+We execute a formal Global Moran's I hypothesis test to determine whether global health metrics display statistically significant spatial clustering ($I > 0$), dispersion ($I < 0$), or randomness ($I \approx 0$).
+
+```{r}
+moran_global <- moran.test(spatial_df$life_exp, listw = spatial_weights, zero.policy = TRUE)
+print(moran_global)
+```
+
+### Local Indicators of Spatial Association (LISA)
+
+While Global Moran's I provides a single index for the entire globe, Local Indicators of Spatial Association (LISA) identify localized spatial clusters:
+
+- **High-High (Hotspot)**: High life expectancy nation surrounded by high life expectancy neighbors.
+- **Low-Low (Coldspot)**: Low life expectancy nation surrounded by low life expectancy neighbors.
+- **Low-High / High-Low (Spatial Outliers)**: Nations whose outcomes significantly deviate from their surroundings.
+
+```{r}
+lisa_results <- localmoran(spatial_df$life_exp, listw = spatial_weights, zero.policy = TRUE)
+
+spatial_df <- spatial_df %>%
+  mutate(
+    local_moran_i = lisa_results[, "Ii"],
+    lisa_p_value  = lisa_results[, "Pr(z != E(Ii))"],
+    quadrant = case_when(
+      scale_life_exp > 0 & scale_lag_life_exp > 0 ~ "High-High",
+      scale_life_exp < 0 & scale_lag_life_exp < 0 ~ "Low-Low",
+      scale_life_exp < 0 & scale_lag_life_exp > 0 ~ "Low-High",
+      scale_life_exp > 0 & scale_lag_life_exp < 0 ~ "High-Low",
+      TRUE ~ "Not Significant"
+    ),
+    cluster_category = if_else(lisa_p_value < 0.05, quadrant, "Not Significant")
+  )
+```
+
+```{r}
+lisa_colors <- c(
+  "High-High"       = "#d7191c",
+  "Low-Low"         = "#2b83ba",
+  "Low-High"        = "#fdae61",
+  "High-Low"        = "#abdda4",
+  "Not Significant" = "grey85"
+)
+
+fig4 <- ggplot(data = spatial_df) +
+  geom_sf(aes(fill = cluster_category), color = "white", size = 0.15) +
+  scale_fill_manual(values = lisa_colors, name = "LISA Cluster Type\n(p < 0.05)") +
+  theme_minimal() +
+  labs(
+    title = "Figure 4: Local Indicators of Spatial Association (LISA) Cluster Map",
+    subtitle = "Statistically Significant Health Hotspots (High-High) & Coldspots (Low-Low)"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+print(fig4)
+```
+
+```{r}
+fig5 <- ggplot(spatial_df, aes(x = continent, y = local_moran_i, fill = continent)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.fill = "red") +
+  scale_fill_brewer(palette = "Set3") +
+  theme_minimal() +
+  labs(
+    title = "Figure 5: Magnitude of Local Spatial Clustering Across Continents",
+    subtitle = "Higher Positive Local Moran Statistics Indicate Stronger Local Spatial Dependence",
+    x = "Continent",
+    y = "Local Moran's I Statistic (Ii)"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 13)
+  )
+
+print(fig5)
+```
+
+## Student Coding Lab Exercises
+
+Complete these exercises in your R environment to practice your spatial analytics pipeline.
+
+### Exercise 1: Extract Significant Cluster Lists
+
+Write a `dplyr` pipeline using `spatial_df` to display all countries identified as statistically significant **High-High** hotspots or **Low-Low** coldspots ($p < 0.05$), arranged by life expectancy.
+
+```{r}
+# EXERCISE 1: Extract significant LISA clusters
+significant_clusters <- spatial_df %>%
+  st_drop_geometry() %>%
+  filter(lisa_p_value < 0.05, cluster_category %in% c("High-High", "Low-Low")) %>%
+  select(country, continent, life_exp, cluster_category, lisa_p_value) %>%
+  arrange(cluster_category, desc(life_exp))
+
+head(significant_clusters, 10)
+```
+
+### Exercise 2: K-Nearest Neighbors (KNN = 4) Sensitivity Analysis
+
+Re-calculate spatial weight matrices using a **K-Nearest Neighbors** specification ($k = 4$) via `knearneigh()` and `knn2nb()` to evaluate how forcing island nations to possess 4 spatial neighbors alters Global Moran's I.
+
+```{r}
+# EXERCISE 2: KNN Spatial Weight Matrix
+coords <- st_centroid(st_geometry(spatial_df))
+knn_neighbors <- knearneigh(coords, k = 4)
+knn_nb <- knn2nb(knn_neighbors)
+knn_weights <- nb2listw(knn_nb, style = "W")
+
+knn_moran_test <- moran.test(spatial_df$life_exp, listw = knn_weights, zero.policy = TRUE)
+knn_moran_test
+```
+
+### Exercise 3: Distance-Based Spatial Weights
+
+Construct a distance-threshold spatial weight matrix using `dnearneigh()` and execute a Global Moran's I test to evaluate distance decay effects across sovereign states.
+
+```{r}
+# EXERCISE 3: Distance-threshold spatial weight matrix
+max_dist <- max(unlist(nbdists(poly2nb(spatial_df, queen = TRUE), coords)))
+dist_nb <- dnearneigh(coords, d1 = 0, d2 = max_dist)
+dist_weights <- nb2listw(dist_nb, style = "W", zero.policy = TRUE)
+
+moran.test(spatial_df$life_exp, listw = dist_weights, zero.policy = TRUE)
+```
+
+### Exercise 4: Identifying Spatial Outliers
+
+Write a `dplyr` pipeline to isolate and display all statistically significant spatial outliers (**High-Low** and **Low-High** cases) where national health outcomes sharply diverge from neighboring trends.
+
+```{r}
+# EXERCISE 4: Filter spatial outliers
+spatial_outliers <- spatial_df %>%
+  st_drop_geometry() %>%
+  filter(lisa_p_value < 0.05, cluster_category %in% c("High-Low", "Low-High")) %>%
+  select(country, continent, life_exp, spatial_lag_life_exp, cluster_category, lisa_p_value)
+
+spatial_outliers
+```

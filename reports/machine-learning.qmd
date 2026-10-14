@@ -1,0 +1,188 @@
+---
+title: "Workbook 9: Machine Learning for Predictive Social Science"
+subtitle: "Comparing OLS, LASSO Regularization, and Random Forests in Health Trajectories"
+author: "Yaw Dgyal"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    theme: cosmo
+    fig-width: 9
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Theoretical Motivation & Methodological Overview
+
+Traditional statistical modeling in social science emphasizes explanatory inference ($p$-values, unbiased parameters). Machine learning prioritizes out-of-sample prediction error minimization on unseen data.
+
+In this workbook, we implement `tidymodels` to compare baseline OLS, regularized LASSO, and ensemble Random Forests.
+
+---
+
+## 2. Environment Setup & Data Pipeline
+
+```{r setup-and-feature-engineering}
+library(tidyverse)
+library(tidymodels)
+library(ranger)
+library(glmnet)
+library(vip)
+
+# Load raw OWID dataset and engineer dynamic lag features
+owid_raw <- read_csv("../data/life_expectancy_data.csv")
+
+ml_dataset <- owid_raw %>%
+  filter(!is.na(life_exp), !is.na(code)) %>%
+  group_by(country) %>%
+  arrange(year) %>%
+  mutate(
+    life_exp_lag1 = lag(life_exp, 1),
+    life_exp_lag5 = lag(life_exp, 5),
+    life_exp_change_5yr = lag(life_exp, 1) - lag(life_exp, 6)
+  ) %>%
+  ungroup() %>%
+  drop_na(life_exp_lag1, life_exp_lag5, life_exp_change_5yr)
+```
+
+---
+
+## 3. Data Partitioning & Cross-Validation Architecture
+
+```{r data-splitting-cv}
+set.seed(2026)
+
+# 80/20 Stratified Train/Test Split
+data_split <- initial_split(ml_dataset, prop = 0.80, strata = life_exp)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 5-Fold Cross-Validation Folds
+cv_folds <- vfold_cv(train_data, v = 5, strata = life_exp)
+```
+
+---
+
+## 4. Feature Engineering Recipes & Model Specifications
+
+```{r recipe-and-specs}
+ml_recipe <- recipe(
+  life_exp ~ year + life_exp_lag1 + life_exp_lag5 + life_exp_change_5yr + country,
+  data = train_data
+) %>%
+  step_other(country, threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+ols_spec   <- linear_reg() %>% set_engine("lm") %>% set_mode("regression")
+lasso_spec <- linear_reg(penalty = 0.05, mixture = 1) %>% set_engine("glmnet") %>% set_mode("regression")
+rf_spec    <- rand_forest(mtry = 3, trees = 500, min_n = 5) %>% set_engine("ranger", importance = "permutation") %>% set_mode("regression")
+
+ols_wf   <- workflow() %>% add_recipe(ml_recipe) %>% add_model(ols_spec)
+lasso_wf <- workflow() %>% add_recipe(ml_recipe) %>% add_model(lasso_spec)
+rf_wf    <- workflow() %>% add_recipe(ml_recipe) %>% add_model(rf_spec)
+```
+
+---
+
+## 5. Model Training & Cross-Validation Evaluation
+
+```{r cross-validation-execution}
+eval_metrics <- metric_set(rmse, rsq, mae)
+
+ols_cv_results   <- fit_resamples(ols_wf, resamples = cv_folds, metrics = eval_metrics)
+lasso_cv_results <- fit_resamples(lasso_wf, resamples = cv_folds, metrics = eval_metrics)
+rf_cv_results    <- fit_resamples(rf_wf, resamples = cv_folds, metrics = eval_metrics)
+
+cv_summary <- bind_rows(
+  collect_metrics(ols_cv_results) %>% mutate(Model = "OLS Baseline"),
+  collect_metrics(lasso_cv_results) %>% mutate(Model = "LASSO Regularized"),
+  collect_metrics(rf_cv_results) %>% mutate(Model = "Random Forest")
+) %>%
+  filter(.metric == "rmse") %>%
+  select(Model, Metric = .metric, Mean_RMSE = mean, Std_Error = std_err)
+```
+
+---
+
+## 6. Comprehensive Visualizations (5 Figures)
+
+### Figure 1: Out-of-Sample Cross-Validation RMSE Comparison
+
+```{r figure-1-cv-comparison}
+ggplot(cv_summary, aes(x = reorder(Model, -Mean_RMSE), y = Mean_RMSE, fill = Model)) +
+  geom_col(width = 0.5, color = "black", alpha = 0.85) +
+  geom_errorbar(aes(ymin = Mean_RMSE - Std_Error, ymax = Mean_RMSE + Std_Error), width = 0.15) +
+  geom_text(aes(label = round(Mean_RMSE, 3)), vjust = -0.8, fontface = "bold") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(
+    title = "Figure 1: Cross-Validation RMSE Comparison Across Models",
+    x = "Algorithm Architecture",
+    y = "Cross-Validation Mean RMSE (Years)"
+  ) +
+  theme(legend.position = "none")
+```
+
+### Figure 2: Predicted vs. Actual Life Expectancy
+
+```{r figure-2-predicted-vs-actual}
+final_rf_fit <- fit(rf_wf, data = train_data)
+test_predictions <- predict(final_rf_fit, test_data) %>% bind_cols(test_data)
+
+ggplot(test_predictions, aes(x = life_exp, y = .pred)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", size = 1) +
+  geom_point(alpha = 0.4, color = "steelblue", size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Figure 2: Random Forest Predicted vs. Actual Life Expectancy (Test Set)",
+    x = "Actual Observed Life Expectancy (Years)",
+    y = "Random Forest Predicted Life Expectancy (Years)"
+  )
+```
+
+### Figure 3: Residual Error Distribution
+
+```{r figure-3-residual-distribution}
+test_predictions <- test_predictions %>% mutate(residual = life_exp - .pred)
+
+ggplot(test_predictions, aes(x = residual)) +
+  geom_histogram(bins = 40, fill = "midnightblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "firebrick", size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Figure 3: Distribution of Out-of-Sample Prediction Residuals",
+    x = "Prediction Residual Error (Years)",
+    y = "Observation Frequency"
+  )
+```
+
+### Figure 4: LASSO Coefficient Regularization Trace Path
+
+```{r figure-4-lasso-trace}
+lasso_fit <- fit(lasso_wf, data = train_data)
+glmnet_obj <- extract_fit_engine(lasso_fit)
+plot(glmnet_obj, xvar = "lambda", label = TRUE)
+title("Figure 4: LASSO Coefficient Shrinkage Trace Path", line = 2.5)
+```
+
+### Figure 5: Random Forest Permutation Variable Importance
+
+```{r figure-5-variable-importance}
+final_rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point", num_features = 10, horizontal = TRUE) +
+  aes(color = Importance) +
+  scale_color_viridis_c(option = "viridis") +
+  theme_minimal() +
+  labs(
+    title = "Figure 5: Permutation Variable Importance Spectrum (Random Forest)",
+    x = "Predictor Variables",
+    y = "Importance Score"
+  ) +
+  theme(legend.position = "none")
+```
